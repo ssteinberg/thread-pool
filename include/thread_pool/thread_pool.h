@@ -209,6 +209,7 @@ namespace dp {
         }
 
         [[nodiscard]] auto size() const { return threads_.size(); }
+        [[nodiscard]] const auto& get_threads() const noexcept { return threads_; }
 
         /**
          * @brief Wait for all tasks to finish.
