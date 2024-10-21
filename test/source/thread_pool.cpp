@@ -4,9 +4,12 @@
 #include <thread_pool/version.h>
 
 #include <algorithm>
+#include <array>
+#include <barrier>
 #include <iostream>
 #include <numeric>
 #include <random>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 
@@ -53,6 +56,29 @@ TEST_CASE("Support enqueue with void return type") {
     auto value = 8;
     auto future = pool.enqueue([](int& x) { x *= 2; }, std::ref(value));
     future.wait();
+    CHECK_EQ(value, 16);
+}
+
+TEST_CASE("Support enqueue_detach with void return type") {
+    auto value = 8;
+    {
+        dp::thread_pool pool;
+        pool.enqueue_detach([](int& x) { x *= 2; }, std::ref(value));
+    }
+    CHECK_EQ(value, 16);
+}
+
+TEST_CASE("Support enqueue_detach with non void return type") {
+    auto value = 8;
+    {
+        dp::thread_pool pool;
+        pool.enqueue_detach(
+            [](int& x) {
+                x *= 2;
+                return x;
+            },
+            std::ref(value));
+    }
     CHECK_EQ(value, 16);
 }
 
@@ -446,6 +472,86 @@ TEST_CASE("Ensure wait_for_tasks() properly blocks current execution.") {
     CHECK_EQ(counter.load(), total_tasks);
 }
 
+TEST_CASE("Ensure wait_for_tasks() properly waits for tasks to fully complete") {
+    class counter_wrapper {
+      public:
+        std::atomic_int counter = 0;
+
+        void increment_counter() { counter.fetch_add(1, std::memory_order_release); }
+    };
+
+    dp::thread_pool local_pool{};
+    constexpr auto task_count = 10;
+    std::array<int, task_count> counts{{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}};
+    for (size_t i = 0; i < task_count; i++) {
+        counter_wrapper cnt_wrp{};
+
+        for (size_t var1 = 0; var1 < 17; var1++) {
+            for (int var2 = 0; var2 < 12; var2++) {
+                local_pool.enqueue_detach([&cnt_wrp]() { cnt_wrp.increment_counter(); });
+            }
+        }
+        local_pool.wait_for_tasks();
+        // std::cout << cnt_wrp.counter << std::endl;
+        counts[i] = cnt_wrp.counter.load(std::memory_order_acquire);
+    }
+
+    auto all_correct_count =
+        std::ranges::all_of(counts, [](int count) { return count == 17 * 12; });
+    const auto sum = std::accumulate(counts.begin(), counts.end(), 0);
+    CHECK_EQ(sum, 17 * 12 * task_count);
+    CHECK(all_correct_count);
+}
+
+TEST_CASE("Ensure wait_for_tasks() can be called multiple times on the same pool") {
+    class counter_wrapper {
+      public:
+        std::atomic_int counter = 0;
+
+        void increment_counter() { counter.fetch_add(1, std::memory_order_release); }
+    };
+
+    dp::thread_pool local_pool{};
+    constexpr auto task_count = 10;
+    std::array<int, task_count> counts{{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}};
+    for (size_t i = 0; i < task_count; i++) {
+        counter_wrapper cnt_wrp{};
+
+        for (size_t var1 = 0; var1 < 16; var1++) {
+            for (int var2 = 0; var2 < 13; var2++) {
+                local_pool.enqueue_detach([&cnt_wrp]() { cnt_wrp.increment_counter(); });
+            }
+        }
+        local_pool.wait_for_tasks();
+        // std::cout << cnt_wrp.counter << std::endl;
+        counts[i] = cnt_wrp.counter.load(std::memory_order_acquire);
+    }
+
+    auto all_correct_count =
+        std::ranges::all_of(counts, [](int count) { return count == 16 * 13; });
+    auto sum = std::accumulate(counts.begin(), counts.end(), 0);
+    CHECK_EQ(sum, 16 * 13 * task_count);
+    CHECK(all_correct_count);
+
+    for (size_t i = 0; i < task_count; i++) {
+        counter_wrapper cnt_wrp{};
+
+        for (size_t var1 = 0; var1 < 17; var1++) {
+            for (int var2 = 0; var2 < 12; var2++) {
+                local_pool.enqueue_detach([&cnt_wrp]() { cnt_wrp.increment_counter(); });
+            }
+        }
+        local_pool.wait_for_tasks();
+        // std::cout << cnt_wrp.counter << std::endl;
+        counts[i] = cnt_wrp.counter.load(std::memory_order_acquire);
+    }
+
+    all_correct_count = std::ranges::all_of(counts, [](int count) { return count == 17 * 12; });
+    sum = std::accumulate(counts.begin(), counts.end(), 0);
+    CHECK_EQ(sum, 17 * 12 * task_count);
+    CHECK(all_correct_count);
+}
+
 TEST_CASE("Initialization function is called") {
     std::atomic_int counter = 0;
     {
@@ -455,4 +561,87 @@ TEST_CASE("Initialization function is called") {
         });
     }
     CHECK_EQ(counter.load(), 4);
+}
+
+TEST_CASE("Check clear_tasks() can be called from a task") {
+    // Here:
+    // - we use a barrier to trigger tasks_clear() once all threads are busy;
+    // - to prevent race conditions (e.g. task_clear() getting called whilst we are still adding
+    //   tasks), we use a mutex to prevent the tasks from running, until all tasks have been added
+    //   to the pool.
+
+    unsigned int thread_count = 0;
+
+    SUBCASE("with single thread") { thread_count = 1; }
+    SUBCASE("with multiple threads") { thread_count = 4; }
+
+    std::atomic<unsigned int> counter = 0;
+    dp::thread_pool pool(thread_count);
+    std::shared_mutex mutex;
+
+    {
+        /* Clear thread_pool when barrier is hit, this must not throw */
+        auto clear_func = [&pool]() noexcept {
+            try {
+                pool.clear_tasks();
+            } catch (...) {
+            }
+        };
+        std::barrier sync_point(thread_count, clear_func);
+
+        auto func = [&counter, &sync_point, &mutex]() {
+            std::shared_lock lock(mutex);
+            counter.fetch_add(1);
+            sync_point.arrive_and_wait();
+        };
+
+        {
+            std::unique_lock lock(mutex);
+            for (int i = 0; i < 10; i++) pool.enqueue_detach(func);
+        }
+
+        pool.wait_for_tasks();
+    }
+
+    CHECK_EQ(counter.load(), thread_count);
+}
+
+TEST_CASE("Check clear_tasks() clears tasks") {
+    // Here we:
+    // - add twice as many tasks to the pool as can be run simultaniously
+    // - use a lock to prevent race conditions (e.g. clear_task() running whilst the another task is
+    //   being added)
+
+    unsigned int thread_count{4};
+    size_t cleared_tasks{0};
+    std::atomic<unsigned int> counter{0};
+
+    SUBCASE("with no thread") { thread_count = 0; }
+    SUBCASE("with single thread") { thread_count = 1; }
+    SUBCASE("with multiple threads") { thread_count = 4; }
+
+    {
+        std::mutex mutex;
+        dp::thread_pool pool(thread_count);
+
+        std::function<void(void)> func;
+        func = [&counter, &mutex]() {
+            counter.fetch_add(1);
+            std::lock_guard lock(mutex);
+        };
+
+        {
+            /* fill the thread_pool twice over, and wait until all threads running and locked in a
+             * task */
+            std::lock_guard lock(mutex);
+            for (unsigned int i = 0; i < 2 * thread_count; i++) pool.enqueue_detach(func);
+
+            while (counter != thread_count)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+            cleared_tasks = pool.clear_tasks();
+        }
+    }
+    CHECK_EQ(cleared_tasks, static_cast<size_t>(thread_count));
+    CHECK_EQ(thread_count, counter.load());
 }
